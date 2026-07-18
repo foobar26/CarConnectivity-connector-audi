@@ -223,9 +223,7 @@ class WeConnectSession(AudiWebSession):
         if not submit_data.get("allow"):
             submit_data["allow"] = "true"
 
-        approve_response = self.websession.post(
-            urljoin(consent_url, form.target), data=submit_data, allow_redirects=False
-        )
+        approve_response = self.websession.post(urljoin(consent_url, form.target), data=submit_data, allow_redirects=False)
         if approve_response.status_code >= 400:
             raise AuthenticationError(
                 f"Device authorization approval failed: {approve_response.status_code} {approve_response.text}"
@@ -267,6 +265,8 @@ class WeConnectSession(AudiWebSession):
             try:
                 error = response.json().get("error")
             except ValueError:
+                # Non-JSON error body (e.g. an HTML gateway error page): leave `error` as None
+                # so the branch below raises AuthenticationError with the raw response text.
                 pass
 
             if error == "authorization_pending":
@@ -275,9 +275,7 @@ class WeConnectSession(AudiWebSession):
                 interval += 5
                 time.sleep(interval)
             else:
-                raise AuthenticationError(
-                    f"Device token grant failed: {response.status_code} {response.text}"
-                )
+                raise AuthenticationError(f"Device token grant failed: {response.status_code} {response.text}")
 
         raise AuthenticationError("Timed out waiting for device authorization approval")
 
