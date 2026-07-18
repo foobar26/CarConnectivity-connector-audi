@@ -73,6 +73,41 @@ class HTMLFormParser(HTMLParser):
             self.data[name] = value
 
 
+class GenericFormParser(HTMLParser):
+    """
+    Parses the first ``<form>`` on a page, capturing its ``action`` target and every
+    named ``input``/``button`` value. Used for the device-authorization consent page
+    ("allow"/"deny") which carries no stable form id.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._inside_form: bool = False
+        self.target = None
+        self.data: dict = {}
+
+    def _get_attr(self, attrs, name):
+        for attr in attrs:
+            if attr[0] == name:
+                return attr[1]
+        return None
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag == "form" and self.target is None:
+            self._inside_form = True
+            self.target = self._get_attr(attrs, "action")
+            return
+
+        if self._inside_form and tag in ("input", "button"):
+            name = self._get_attr(attrs, "name")
+            if name:
+                self.data[name] = self._get_attr(attrs, "value")
+
+    def handle_endtag(self, tag) -> None:
+        if tag == "form" and self._inside_form:
+            self._inside_form = False
+
+
 class ScriptFormParser(HTMLParser):
     fields: list[str] = []
     targetField: str = ""

@@ -8,6 +8,7 @@ import json
 import logging
 import time
 from typing import TYPE_CHECKING
+from urllib.parse import urljoin
 
 import requests
 from carconnectivity.errors import AuthenticationError, RetrievalError, TemporaryAuthenticationError
@@ -16,7 +17,20 @@ from oauthlib.oauth2 import InsecureTransportError, is_secure_transport
 from requests.models import CaseInsensitiveDict
 
 from carconnectivity_connectors.audi.auth.audi_web_session import AudiWebSession
+from carconnectivity_connectors.audi.auth.auth_util import GenericFormParser
 from carconnectivity_connectors.audi.auth.openid_session import AccessType
+
+# OAuth Device Authorization Grant (RFC 8628) endpoint at the VW Group identity provider.
+# Since July 2026 CARIAD enforces Google Play Integrity attestation on the classic
+# authorization_code token exchange (rejecting it with "invalid assertion headers"),
+# which cannot be produced off-device. The device grant is not attested, so it is the
+# only flow that still works for a headless client (see issue #32).
+DEVICE_AUTHORIZATION_URL = "https://identity.vwgroup.io/oidc/v1/device_authorization"
+# "mbb" covers the legacy MBB/fs-car endpoints; the rest cover identity and BFF vehicle data.
+DEVICE_CODE_SCOPE = "openid mbb profile badge cars dealers vin"
+# Overall wall-clock ceiling for the interactive-approval + polling loop (device codes
+# expire after ~300s, but we cap our own effort a little below that).
+DEVICE_CODE_TIMEOUT = 290
 
 if TYPE_CHECKING:
     pass
@@ -96,103 +110,176 @@ class WeConnectSession(AudiWebSession):
         )
 
     def login(self):
-        # Use the simple working flow that bypasses MBB registration
-        LOG.info("Starting simple Audi authentication flow")
+        # Since July 2026 CARIAD requires Play Integrity attestation on the
+        # authorization_code token exchange (rejecting it with "invalid assertion
+        # headers"), so the old username/password -> code -> token flow is dead.
+        # Use the OAuth Device Authorization Grant instead, auto-approving the
+        # device with the stored credentials so the connector stays headless.
+        LOG.info("Starting Audi device-authorization login flow")
 
-        # Don't call the complex dual-token super().login()
-        # Instead, use the direct OAuth2 approach
-
-        # Generate authorization URL
-        authorization_url_str: str = self.authorization_url(url="https://identity.vwgroup.io/oidc/v1/authorize")
-        LOG.debug(f"Generated authorization URL: {authorization_url_str[:100]}...")
-
-        # Perform web authentication (this should work with the original AudiWebSession.do_web_auth)
-        response = self.do_web_auth(authorization_url_str)
-        LOG.debug(f"Web auth completed, got response: {response[:100]}...")
-
-        # Parse authorization response (may contain code or tokens)
-        try:
-            self.parse_from_fragment(response)
-        except Exception as parse_error:
-            LOG.error(f"Failed to parse authentication response: {parse_error}")
-            LOG.debug(f"Response that failed to parse: {response}")
-            raise
-
-        # If we got an authorization code (PKCE flow), exchange it for tokens
-        if self.token and "code" in self.token and "access_token" not in self.token:
-            LOG.info("Authorization code received, exchanging for tokens via PKCE")
-            self._exchange_code_for_tokens()
+        self._login_with_device_code()
 
         if not self.token or "access_token" not in self.token:
-            raise AuthenticationError("Failed to obtain access token from authentication flow")
+            raise AuthenticationError("Failed to obtain access token from device authorization flow")
 
-        LOG.info("Login successful - tokens obtained from OAuth flow!")
+        LOG.info("Login successful - tokens obtained via device authorization grant")
 
         # Set the last_login time
         self.last_login = time.time()
 
-    def _exchange_code_for_tokens(self):
-        """Exchange authorization code for tokens using PKCE at Cariad BFF endpoint (like ioBroker)."""
-        if not self.token or "code" not in self.token:
-            raise AuthenticationError("No authorization code available for token exchange")
+    def _login_with_device_code(self):
+        """Run the OAuth Device Authorization Grant (RFC 8628) and auto-approve it.
 
-        if not hasattr(self, "_code_verifier") or not self._code_verifier:
-            raise AuthenticationError("No code_verifier available for PKCE token exchange")
+        The device grant is not subject to the Play Integrity attestation CARIAD now
+        enforces on the authorization_code grant, so it is the only flow that still
+        completes for an off-device client. We drive the browser approval step
+        programmatically using the stored username/password so no manual interaction
+        is required.
+        """
+        # Step 1: request a device code.
+        device_response = self.websession.post(
+            DEVICE_AUTHORIZATION_URL,
+            data={"client_id": self.client_id, "scope": DEVICE_CODE_SCOPE},
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        )
+        if device_response.status_code != requests.codes["ok"]:
+            raise AuthenticationError(
+                f"Device authorization request failed: {device_response.status_code} {device_response.text}"
+            )
+        device_data = device_response.json()
+        if "device_code" not in device_data:
+            raise AuthenticationError(f"Device authorization response missing device_code: {device_data}")
 
-        # Current CARIAD/Auth0 OIDC token endpoint (per the IDK openid-configuration
-        # discovery document). The old /login/v1/idk/token path was retired in May 2026
-        # and now returns 403/401 (see issues #27/#28/#29).
+        device_code: str = device_data["device_code"]
+        verification_uri: str = device_data.get("verification_uri_complete") or device_data.get("verification_uri")
+        interval: int = int(device_data.get("interval", 5))
+        LOG.debug(f"Device authorization started, user_code={device_data.get('user_code')}, interval={interval}s")
+
+        # Step 2: approve the device using the stored credentials (headless).
+        self._approve_device_authorization(verification_uri)
+
+        # Step 3: poll the token endpoint until the approval is registered.
+        self._poll_for_device_token(device_code, interval)
+
+    def _approve_device_authorization(self, verification_uri: str) -> None:
+        """Approve a pending device authorization using the stored username/password.
+
+        The verification URL redirects into the normal identity.vwgroup.io sign-in
+        flow (email form, then password form) and finishes on a consent page with
+        "allow"/"deny" buttons, which we submit with "allow".
+        """
+        base = "https://identity.vwgroup.io"
+
+        # The sign-in email form (parent follows the initial redirects for us).
+        email_form = self._get_login_form(verification_uri)
+        if email_form is None:
+            raise AuthenticationError("Could not reach the Audi sign-in form for device approval")
+        email_form.data["email"] = self.session_user.username
+
+        # The credentials (password) form.
+        password_form = self._get_password_form(urljoin(base, email_form.target), email_form.data)
+        password_form.data["email"] = self.session_user.username
+        password_form.data["password"] = self.session_user.password
+
+        response = self.websession.post(
+            f"{base}/signin-service/v1/{self.client_id}/{password_form.target}",
+            data=password_form.data,
+            allow_redirects=False,
+        )
+
+        # Follow the post-login redirect chain until we reach the device consent page
+        # (a 200 HTML page carrying the allow/deny form), accepting terms if prompted.
+        url = response.headers.get("Location")
+        consent_page = None
+        for _ in range(15):
+            if not url:
+                break
+            full_url = urljoin(base, url)
+
+            if "terms-and-conditions" in full_url:
+                if self.accept_terms_on_login:
+                    url = self._handle_consent_form(full_url)
+                    continue
+                raise AuthenticationError(
+                    f'You need to accept the terms and conditions. Visit "{full_url}" or log into the myAudi app.'
+                )
+
+            response = self.websession.get(full_url, allow_redirects=False)
+            if response.status_code == requests.codes["ok"]:
+                consent_page = response.text
+                consent_url = full_url
+                break
+            url = response.headers.get("Location")
+
+        if consent_page is None:
+            raise AuthenticationError("Did not reach the device authorization consent page")
+
+        # Submit the consent form with "allow" (dropping "deny" — sending both errors out).
+        form = GenericFormParser()
+        form.feed(consent_page)
+        if form.target is None or "allow" not in form.data:
+            raise AuthenticationError("Could not find the device authorization consent form")
+        submit_data = {key: value for key, value in form.data.items() if key != "deny"}
+        if not submit_data.get("allow"):
+            submit_data["allow"] = "true"
+
+        approve_response = self.websession.post(
+            urljoin(consent_url, form.target), data=submit_data, allow_redirects=False
+        )
+        if approve_response.status_code >= 400:
+            raise AuthenticationError(
+                f"Device authorization approval failed: {approve_response.status_code} {approve_response.text}"
+            )
+        LOG.debug("Device authorization approved")
+
+    def _poll_for_device_token(self, device_code: str, interval: int) -> None:
+        """Poll the IDK token endpoint for the approved device_code grant."""
         token_url = "https://emea.bff.cariad.digital/auth/v1/idk/oidc/token"
-
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
         token_data = {
-            "grant_type": "authorization_code",
-            "code": self.token["code"],
-            "redirect_uri": self.redirect_uri,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             "client_id": self.client_id,
-            "code_verifier": self._code_verifier,
+            "device_code": device_code,
         }
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
-
-        LOG.debug(f"Exchanging code for tokens at {token_url}")
-        LOG.debug(f"Token exchange params: client_id={self.client_id}, redirect_uri={self.redirect_uri}")
-        LOG.debug(f"Token exchange code_verifier length: {len(self._code_verifier)}")
-        try:
+        deadline = time.time() + DEVICE_CODE_TIMEOUT
+        while time.time() < deadline:
             response = self.websession.post(token_url, data=token_data, headers=headers)
-            response.raise_for_status()
+            if response.status_code == requests.codes["ok"]:
+                token_response = response.json()
+                LOG.debug(f"Device token grant successful, received keys: {list(token_response.keys())}")
 
-            token_response = response.json()
-            LOG.debug(f"IDK token exchange successful, received keys: {list(token_response.keys())}")
+                new_token = {
+                    "access_token": token_response["access_token"],
+                    "token_type": token_response.get("token_type", "bearer"),
+                }
+                if "expires_in" in token_response:
+                    new_token["expires_in"] = int(token_response["expires_in"])
+                    new_token["expires_at"] = time.time() + int(token_response["expires_in"])
+                if "id_token" in token_response:
+                    new_token["id_token"] = token_response["id_token"]
+                if "refresh_token" in token_response:
+                    new_token["refresh_token"] = token_response["refresh_token"]
+                self.token = new_token
+                return
 
-            # Update self.token with the received tokens
-            self.token = {
-                "access_token": token_response["access_token"],
-                "token_type": token_response.get("token_type", "bearer"),
-            }
+            error = None
+            try:
+                error = response.json().get("error")
+            except ValueError:
+                pass
 
-            if "expires_in" in token_response:
-                self.token["expires_in"] = int(token_response["expires_in"])
-                self.token["expires_at"] = time.time() + int(token_response["expires_in"])
-            if "id_token" in token_response:
-                self.token["id_token"] = token_response["id_token"]
-            if "refresh_token" in token_response:
-                self.token["refresh_token"] = token_response["refresh_token"]
+            if error == "authorization_pending":
+                time.sleep(interval)
+            elif error == "slow_down":
+                interval += 5
+                time.sleep(interval)
+            else:
+                raise AuthenticationError(
+                    f"Device token grant failed: {response.status_code} {response.text}"
+                )
 
-            LOG.info("IDK token exchange completed successfully")
-
-            # Note: the previously-used Audi-specific token exchange
-            # (/login/v1/audi/token) is no longer required — the IDK access_token
-            # returned above is accepted directly by the Cariad BFF vehicle APIs.
-
-        except requests.RequestException as e:
-            LOG.error(f"Token exchange failed: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                LOG.error(f"Token exchange error response: {e.response.text}")
-                LOG.error(f"Token exchange response headers: {dict(e.response.headers)}")
-            raise AuthenticationError(f"Failed to exchange authorization code for tokens: {e}") from e
+        raise AuthenticationError("Timed out waiting for device authorization approval")
 
     def _get_audi_token(self):
         """Exchange IDK token for Audi-specific token (like ioBroker does)."""
