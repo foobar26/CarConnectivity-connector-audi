@@ -9,9 +9,52 @@ import json
 import re
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from typing import Dict, Optional
+
+
+# Path fragment of the optional marketing consent page the VW Group identity provider
+# periodically interjects into an otherwise successful sign-in (see issue #32).
+MARKETING_CONSENT_PATH = "/consent/marketing"
+
+
+def is_marketing_consent_url(url: str) -> bool:
+    """Report whether `url` points at the VW Group marketing consent page."""
+    return MARKETING_CONSENT_PATH in urlsplit(url).path
+
+
+def marketing_consent_callback_url(url: str) -> Optional[str]:
+    """
+    Extract the OIDC callback URL embedded in a marketing consent page URL.
+
+    The identity provider periodically interrupts the sign-in redirect chain with an
+    optional marketing consent page (``.../signin-service/v1/consent/marketing/...``).
+    That page URL carries the OIDC ``callback`` URL that continues the login *without*
+    consenting: following it lands on ``/oidc/v1/oauth/client/callback/success`` with
+    only the originally requested scopes in ``consentedScopes``, and the flow resumes.
+    This keeps a headless login working instead of stalling until the user answers the
+    consent prompt in a browser.
+
+    Args:
+        url (str): The URL of the marketing consent page.
+
+    Returns:
+        Optional[str]: The callback URL to follow, or None if `url` is not a marketing
+                       consent page or carries no callback.
+    """
+    if not is_marketing_consent_url(url):
+        return None
+
+    callback: Optional[str] = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True)).get("callback")
+    if not callback:
+        return None
+
+    # The callback carries space-separated scope lists, so re-encode its query to make
+    # sure the URL we request is valid.
+    parts = urlsplit(callback)
+    return urlunsplit(parts._replace(query=urlencode(parse_qsl(parts.query, keep_blank_values=True))))
 
 
 def add_bearer_auth_header(token, headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:

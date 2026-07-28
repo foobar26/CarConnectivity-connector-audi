@@ -17,7 +17,11 @@ from oauthlib.oauth2 import InsecureTransportError, is_secure_transport
 from requests.models import CaseInsensitiveDict
 
 from carconnectivity_connectors.audi.auth.audi_web_session import AudiWebSession
-from carconnectivity_connectors.audi.auth.auth_util import GenericFormParser
+from carconnectivity_connectors.audi.auth.auth_util import (
+    GenericFormParser,
+    is_marketing_consent_url,
+    marketing_consent_callback_url,
+)
 from carconnectivity_connectors.audi.auth.openid_session import AccessType
 
 # OAuth Device Authorization Grant (RFC 8628) endpoint at the VW Group identity provider.
@@ -188,9 +192,11 @@ class WeConnectSession(AudiWebSession):
         )
 
         # Follow the post-login redirect chain until we reach the device consent page
-        # (a 200 HTML page carrying the allow/deny form), accepting terms if prompted.
+        # (a 200 HTML page carrying the allow/deny form), accepting terms if prompted
+        # and skipping the optional marketing consent page.
         url = response.headers.get("Location")
         consent_page = None
+        consent_url = None
         for _ in range(15):
             if not url:
                 break
@@ -204,6 +210,10 @@ class WeConnectSession(AudiWebSession):
                     f'You need to accept the terms and conditions. Visit "{full_url}" or log into the myAudi app.'
                 )
 
+            if is_marketing_consent_url(full_url):
+                url = self._skip_marketing_consent(full_url)
+                continue
+
             response = self.websession.get(full_url, allow_redirects=False)
             if response.status_code == requests.codes["ok"]:
                 consent_page = response.text
@@ -211,14 +221,17 @@ class WeConnectSession(AudiWebSession):
                 break
             url = response.headers.get("Location")
 
-        if consent_page is None:
+        if consent_page is None or consent_url is None:
             raise AuthenticationError("Did not reach the device authorization consent page")
 
         # Submit the consent form with "allow" (dropping "deny" — sending both errors out).
         form = GenericFormParser()
         form.feed(consent_page)
         if form.target is None or "allow" not in form.data:
-            raise AuthenticationError("Could not find the device authorization consent form")
+            raise AuthenticationError(
+                f'Could not find the device authorization consent form at "{consent_url}". '
+                "If that page asks for a consent decision, answer it once in a browser and retry."
+            )
         submit_data = {key: value for key, value in form.data.items() if key != "deny"}
         if not submit_data.get("allow"):
             submit_data["allow"] = "true"
@@ -229,6 +242,39 @@ class WeConnectSession(AudiWebSession):
                 f"Device authorization approval failed: {approve_response.status_code} {approve_response.text}"
             )
         LOG.debug("Device authorization approved")
+
+    def _skip_marketing_consent(self, url: str) -> str:
+        """Continue past the optional marketing consent page without consenting.
+
+        The identity provider re-asks for marketing consent every few weeks, and a
+        rejected prompt comes back again later. It appears as a 200 HTML page in the
+        middle of the sign-in redirect chain, which would otherwise be mistaken for the
+        device consent page. The page URL carries the OIDC callback that resumes the
+        login granting only the scopes we originally requested, so we follow that and
+        leave the marketing decision to the user's browser/app.
+
+        Args:
+            url (str): The URL of the marketing consent page.
+
+        Returns:
+            str: The next URL in the redirect chain.
+        """
+        callback_url: str | None = marketing_consent_callback_url(url)
+        if callback_url is None:
+            raise AuthenticationError(
+                f'Audi is asking for marketing consent and the page carries no callback to skip it: "{url}". '
+                "Answer the prompt once in a browser or the myAudi app, then retry."
+            )
+
+        LOG.info("Skipping the optional marketing consent page without consenting")
+        response = self.websession.get(callback_url, allow_redirects=False)
+        next_url: str | None = response.headers.get("Location")
+        if not next_url:
+            raise AuthenticationError(
+                f"Could not skip the marketing consent page: {response.status_code} response without redirect. "
+                f'Answer the prompt at "{url}" in a browser or the myAudi app, then retry.'
+            )
+        return next_url
 
     def _poll_for_device_token(self, device_code: str, interval: int) -> None:
         """Poll the IDK token endpoint for the approved device_code grant."""
