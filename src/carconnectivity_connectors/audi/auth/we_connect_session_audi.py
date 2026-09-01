@@ -250,14 +250,18 @@ class WeConnectSession(AudiWebSession):
         rejected prompt comes back again later. It appears as a 200 HTML page in the
         middle of the sign-in redirect chain, which would otherwise be mistaken for the
         device consent page. The page URL carries the OIDC callback that resumes the
-        login granting only the scopes we originally requested, so we follow that and
-        leave the marketing decision to the user's browser/app.
+        login granting only the scopes we originally requested, so we hand that back to
+        the redirect loop and leave the marketing decision to the user's browser/app.
+
+        We deliberately do not fetch the callback here: it answers with a redirect for
+        some accounts and serves the device consent page directly for others (issue #32),
+        so the loop — which already handles both — has to be the one to request it.
 
         Args:
             url (str): The URL of the marketing consent page.
 
         Returns:
-            str: The next URL in the redirect chain.
+            str: The next URL to follow in the redirect chain.
         """
         callback_url: str | None = marketing_consent_callback_url(url)
         if callback_url is None:
@@ -267,14 +271,7 @@ class WeConnectSession(AudiWebSession):
             )
 
         LOG.info("Skipping the optional marketing consent page without consenting")
-        response = self.websession.get(callback_url, allow_redirects=False)
-        next_url: str | None = response.headers.get("Location")
-        if not next_url:
-            raise AuthenticationError(
-                f"Could not skip the marketing consent page: {response.status_code} response without redirect. "
-                f'Answer the prompt at "{url}" in a browser or the myAudi app, then retry.'
-            )
-        return next_url
+        return callback_url
 
     def _poll_for_device_token(self, device_code: str, interval: int) -> None:
         """Poll the IDK token endpoint for the approved device_code grant."""
