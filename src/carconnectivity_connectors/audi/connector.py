@@ -2778,8 +2778,21 @@ class Connector(BaseConnector):
         if vin is None:
             raise ValueError("vehicle.vin cannot be None")
         url: str = f"https://emea.bff.cariad.digital/vehicle/v1/vehicles/{vin}/parkingposition"
+        # The parking position is optional data from a flaky upstream: it answers 404 when the
+        # position is unknown and 5xx ("Bad Gateway", flagged retryable by the backend itself)
+        # while the upstream is unavailable. Tolerate both, otherwise a transient gateway error
+        # aborts the whole update cycle - including decide_state() and any remaining vehicles.
         data: Dict[str, Any] | None = self._fetch_data(
-            url, self.session, allow_empty=True, allow_http_error=True, allowed_errors=[requests.codes["not_found"]]
+            url,
+            self.session,
+            allow_empty=True,
+            allow_http_error=True,
+            allowed_errors=[
+                requests.codes["not_found"],
+                requests.codes["bad_gateway"],
+                requests.codes["service_unavailable"],
+                requests.codes["gateway_timeout"],
+            ],
         )
         if data is not None and "data" in data and data["data"] is not None:
             if "carCapturedTimestamp" not in data["data"] or data["data"]["carCapturedTimestamp"] is None:
