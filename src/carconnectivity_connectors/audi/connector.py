@@ -823,6 +823,7 @@ class Connector(BaseConnector):
         LOG_API.debug("Requesting selectivestatus URL: %s", url)
         data: Dict[str, Any] | None = self._fetch_data(url, self.session)
         if data is not None:
+            self._log_status_job_errors(vin, data)
             try:
                 self._process_vehicle_status_data(vehicle, data)
             except APIError as e:
@@ -839,6 +840,46 @@ class Connector(BaseConnector):
             except Exception as e:
                 LOG.error("Unexpected error processing vehicle status for %s: %s", vin, e)
                 raise e
+
+    def _log_status_job_errors(self, vin: str, data: Dict[str, Any]) -> None:
+        """
+        Report the status jobs the backend answered with an error instead of data.
+
+        selectivestatus is a multi-status response: every requested job carries either a
+        value or its own error object, and a job in error is simply skipped during
+        processing. Without this the skip is invisible - the affected attributes just
+        stop updating and nothing in the log explains why (see issue #32).
+
+        Args:
+            vin (str): The VIN the status was requested for.
+            data (Dict[str, Any]): The parsed selectivestatus response.
+        """
+        failed: Dict[str, str] = {}
+        for job, content in data.items():
+            if not isinstance(content, dict):
+                continue
+            # The error sits either directly on the job or on one of its sub-jobs.
+            candidates = {job: content} if isinstance(content.get("error"), dict) else content
+            for sub_job, sub_content in candidates.items():
+                if not isinstance(sub_content, dict) or not isinstance(sub_content.get("error"), dict):
+                    continue
+                error: Dict[str, Any] = sub_content["error"]
+                message = error.get("message") or error.get("info") or "unknown error"
+                failed[sub_job if sub_job == job else f"{job}/{sub_job}"] = f"{message} (code {error.get('code')})"
+
+        if not failed:
+            return
+
+        LOG.warning(
+            "Audi backend returned an error for %d of %d status jobs for %s: %s. "
+            "The affected attributes keep their previous values until it recovers.",
+            len(failed),
+            len(data),
+            vin,
+            ", ".join(sorted(failed)),
+        )
+        for job, detail in sorted(failed.items()):
+            LOG.info("Status job %s for %s failed: %s", job, vin, detail)
 
     def _process_vehicle_status_data(self, vehicle: AudiVehicle, data: Dict[str, Any]) -> None:
         """Process vehicle status data with strict timestamp validation"""
