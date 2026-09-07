@@ -158,6 +158,16 @@ class OpenIDSession(requests.Session):
             None
         """
         if new_token is not None:
+            # Never let a token without its own refresh token drop the one we already hold.
+            # An interrupted login leaves a partial token behind (e.g. parse_from_fragment
+            # stores the authorization code and state, and only the following exchange adds
+            # the tokens); if that replaces a working token wholesale, the still-valid
+            # refresh token is lost and a backend outage that refresh would have ridden out
+            # turns into a login that cannot be repeated (see issue #32). Carrying it over
+            # is the safe direction: a stale refresh token merely fails and falls back to
+            # the login flow, while a discarded one cannot be recovered at all.
+            if "refresh_token" not in new_token and self._token is not None and "refresh_token" in self._token:
+                new_token["refresh_token"] = self._token["refresh_token"]
             # If new token e.g. after refresh is missing expires_in we assume it is the same than before
             if "expires_in" not in new_token:
                 if self._token is not None and "expires_in" in self._token:
