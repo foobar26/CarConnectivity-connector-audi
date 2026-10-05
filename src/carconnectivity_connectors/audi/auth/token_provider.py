@@ -19,7 +19,9 @@ None of these ever log token material; see :func:`seed_refresh_token`.
 from __future__ import annotations
 
 import abc
+import hashlib
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from carconnectivity.errors import AuthenticationError
@@ -101,4 +103,45 @@ def seed_refresh_token(session: "OpenIDSession", refresh_token: "Optional[str]")
     # are filled in by the first refresh. token.setter must not log this value.
     session.token = {"refresh_token": refresh_token, "token_type": "bearer"}
     LOG.info("Seeded an externally provided Audi refresh token into the session")
+    return True
+
+
+# Metadata key recording which token-file content was last applied, so dropping a new
+# file re-provisions exactly once and a stale file left in place is ignored afterwards
+# (the connector rotates its stored token on every refresh, so the file will normally
+# differ from the live token — we must NOT keep overwriting the good rotated token).
+_SEEDED_FILE_HASH_KEY = "seeded_refresh_file_hash"
+
+
+def seed_refresh_token_from_file(session: "OpenIDSession", path: "Optional[str]") -> bool:
+    """Apply a refresh token from `path`, replacing the stored one, but only when the
+    file's content has changed since it was last applied.
+
+    This is the easy re-provision path for when the refresh token is invalidated: drop
+    the new token into the file and restart. Unlike :func:`seed_refresh_token`, this
+    *replaces* an existing stored token — because the user supplying a new file is an
+    explicit intent to re-provision — but it is gated on a hash stored in the session
+    metadata so it fires once per new file and never clobbers the connector's own
+    freshly rotated token on later restarts.
+
+    Returns:
+        True if a new token was applied, False otherwise (no file, empty, or unchanged).
+    """
+    if not path:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as err:
+        LOG.warning("Could not read Audi refresh token file %s: %s", path, err)
+        return False
+    if not token:
+        return False
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if session.metadata.get(_SEEDED_FILE_HASH_KEY) == digest:
+        LOG.debug("Audi refresh token file unchanged since last applied; keeping stored token")
+        return False
+    session.token = {"refresh_token": token, "token_type": "bearer"}
+    session.metadata[_SEEDED_FILE_HASH_KEY] = digest
+    LOG.info("Applied a new Audi refresh token from %s", os.path.basename(path))
     return True

@@ -23,6 +23,7 @@ from carconnectivity_connectors.audi.auth.session_manager import SessionUser
 from carconnectivity_connectors.audi.auth.token_provider import (
     SessionTokenProvider,
     seed_refresh_token,
+    seed_refresh_token_from_file,
 )
 from carconnectivity_connectors.audi.auth.we_connect_session_audi import (
     COLDSTART_UNSUPPORTED_COOLDOWN,
@@ -93,6 +94,40 @@ class TestSeedRefreshToken:
         assert seed_refresh_token(session, None) is False
         assert seed_refresh_token(session, "") is False
         assert session.token is None
+
+
+class TestSeedRefreshTokenFromFile:
+    def test_applies_new_file_then_ignores_unchanged(self, tmp_path) -> None:
+        f = tmp_path / "rt.txt"
+        f.write_text("RT-FILE-1\n")  # trailing newline must be stripped
+        session = _session()
+
+        assert seed_refresh_token_from_file(session, str(f)) is True
+        assert session.token["refresh_token"] == "RT-FILE-1"
+
+        # Simulate the connector rotating its stored token after a refresh.
+        session.token = {"refresh_token": "ROTATED", "access_token": "a", "expires_in": 3600}
+        # Same file on the next restart must NOT clobber the rotated token.
+        assert seed_refresh_token_from_file(session, str(f)) is False
+        assert session.token["refresh_token"] == "ROTATED"
+
+    def test_applies_again_when_file_changes(self, tmp_path) -> None:
+        f = tmp_path / "rt.txt"
+        f.write_text("RT-FILE-1")
+        session = _session()
+        assert seed_refresh_token_from_file(session, str(f)) is True
+        session.token = {"refresh_token": "ROTATED", "access_token": "a", "expires_in": 3600}
+        f.write_text("RT-FILE-2")  # user drops a freshly captured token
+        assert seed_refresh_token_from_file(session, str(f)) is True
+        assert session.token["refresh_token"] == "RT-FILE-2"
+
+    def test_missing_or_empty_file(self, tmp_path) -> None:
+        session = _session()
+        assert seed_refresh_token_from_file(session, str(tmp_path / "nope.txt")) is False
+        empty = tmp_path / "empty.txt"
+        empty.write_text("   \n")
+        assert seed_refresh_token_from_file(session, str(empty)) is False
+        assert seed_refresh_token_from_file(session, None) is False
 
 
 # ---------------------------------------------------------- dead cold-start classification

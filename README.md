@@ -98,9 +98,32 @@ the connector run from the resulting refresh token:
 The connector seeds this token only when its token store is empty, refreshes it
 itself from then on, and **never overwrites a working token** that is already
 cached. Username and password are still required (they key the session and are
-used by any future interactive flow). If the refresh token ever dies, repeat the
-three steps above after clearing the token file. Tokens and callback URLs are
-redacted from all logs.
+used by any future interactive flow). Tokens and callback URLs are redacted from
+all logs.
+
+#### Re-provisioning with `refresh_token_file`
+
+Because the connector refreshes and rotates its own token, you normally never
+touch this again. If the refresh token is ever invalidated, the easiest way to
+hand over a fresh one is a file:
+
+```json
+{
+    "type": "audi",
+    "config": {
+        "username": "your.email@example.com",
+        "password": "your_password",
+        "refresh_token_file": "/etc/carconnect/audi_refresh_token"
+    }
+}
+```
+
+(or set `AUDI_REFRESH_TOKEN_FILE` to that path). Drop the newly captured token
+into that file and restart the connector — it applies the file's token exactly
+once per change (tracked by a content hash in the token store), so a stale file
+left in place will **not** clobber the connector's own freshly rotated token on
+later restarts. To force a re-provision, overwrite the file with a new token and
+restart.
 
 ## Usage
 

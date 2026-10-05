@@ -66,7 +66,12 @@ from oauthlib.oauth2.rfc6749.errors import MissingCodeError, MissingTokenError, 
 
 from carconnectivity_connectors.audi._version import __version__
 from carconnectivity_connectors.audi.auth.session_manager import Service, SessionManager, SessionUser
-from carconnectivity_connectors.audi.auth.token_provider import AudiTokenProvider, SessionTokenProvider, seed_refresh_token
+from carconnectivity_connectors.audi.auth.token_provider import (
+    AudiTokenProvider,
+    SessionTokenProvider,
+    seed_refresh_token,
+    seed_refresh_token_from_file,
+)
 from carconnectivity_connectors.audi.auth.we_connect_session_audi import WeConnectSession
 from carconnectivity_connectors.audi.capability import Capability
 from carconnectivity_connectors.audi.charging import AudiCharging, mapping_audi_charging_state
@@ -213,6 +218,12 @@ class Connector(BaseConnector):
         # itself and drives every API call off-device. Env var provided so the secret need
         # not sit in the config file. It is seeded only when no token is already stored.
         self.active_config["refresh_token"] = config.get("refresh_token") or os.environ.get("AUDI_REFRESH_TOKEN")
+        # A file to read the refresh token from (the easy re-provision path: drop a new
+        # token into this file and restart). Takes precedence so a freshly provided file
+        # replaces a dead stored token; see seed_refresh_token_from_file.
+        self.active_config["refresh_token_file"] = config.get("refresh_token_file") or os.environ.get(
+            "AUDI_REFRESH_TOKEN_FILE"
+        )
 
         self.active_config["username"] = None
         self.active_config["password"] = None
@@ -296,6 +307,8 @@ class Connector(BaseConnector):
         # Seed an externally obtained refresh token (Architecture A) before the first
         # refresh, so a fresh install can mint an access token without the dead cold-start
         # flow. Never overwrites a token already restored from the token store.
+        if self.active_config.get("refresh_token_file"):
+            seed_refresh_token_from_file(self.session, self.active_config["refresh_token_file"])
         if self.active_config.get("refresh_token"):
             if seed_refresh_token(self.session, self.active_config["refresh_token"]):
                 LOG.info("Using the configured Audi refresh token for authentication")
