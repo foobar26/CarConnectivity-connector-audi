@@ -14,7 +14,12 @@ from requests.adapters import HTTPAdapter
 from requests.models import CaseInsensitiveDict
 from urllib3.util.retry import Retry
 
-from carconnectivity_connectors.audi.auth.auth_util import CredentialsFormParser, HTMLFormParser, TermsAndConditionsFormParser
+from carconnectivity_connectors.audi.auth.auth_util import (
+    CredentialsFormParser,
+    HTMLFormParser,
+    TermsAndConditionsFormParser,
+    redact_url,
+)
 from carconnectivity_connectors.audi.auth.openid_session import OpenIDSession
 
 if TYPE_CHECKING:
@@ -424,7 +429,7 @@ class AudiWebSession(OpenIDSession):
             if url.startswith(self.redirect_uri):
                 # For myaudi:// URLs, we need to extract tokens and return success
                 # instead of throwing an error
-                LOG.debug(f"Reached redirect URI: {url}")
+                LOG.debug("Reached redirect URI: %s", redact_url(url))
                 # Store the redirect URI so do_web_auth can return it
                 self._last_redirect_uri = url
                 return None  # Signal that we've reached the redirect successfully

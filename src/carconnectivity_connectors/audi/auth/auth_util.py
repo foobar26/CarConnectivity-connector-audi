@@ -20,6 +20,67 @@ if TYPE_CHECKING:
 MARKETING_CONSENT_PATH = "/consent/marketing"
 
 
+# OAuth parameters that carry credentials and must never reach the logs. The myaudi://
+# callback itself carries tokens in its fragment, so a stray "%s" % url or a dumped
+# response body is enough to leak them (see the Architecture-A notes).
+_SECRET_PARAM_NAMES = frozenset(
+    {
+        "access_token",
+        "id_token",
+        "refresh_token",
+        "code",
+        "authorizationcode",
+        "authorization_code",
+        "password",
+        "code_verifier",
+        "assertion",
+        "x-assertion",
+    }
+)
+# Matches "<secret-name> = <value>" or "<secret-name>: <value>" inside a JSON body or
+# query/fragment string (single- or double-quoted, or bare), so we can redact token
+# bodies that are not valid URLs.
+_SECRET_BODY_RE = re.compile(
+    r"""["']?(?P<name>""" + "|".join(sorted(_SECRET_PARAM_NAMES)) + r""")["']?\s*[:=]\s*["']?(?P<value>[^"'&\s,}]+)""",
+    re.IGNORECASE,
+)
+_REDACTED = "<redacted>"
+
+
+def redact_url(url: "Optional[str]") -> str:
+    """Return `url` with the values of any credential-bearing query/fragment parameters
+    replaced by a placeholder, so a callback such as ``myaudi:///#access_token=...`` can
+    be logged for diagnostics without leaking the token. The scheme, host, path and the
+    *names* of the parameters are preserved; only secret values are masked.
+    """
+    if not url:
+        return ""
+    try:
+        split = urlsplit(url)
+
+        def _mask(raw: str) -> str:
+            if not raw:
+                return raw
+            parts = parse_qsl(raw, keep_blank_values=True)
+            if not parts:
+                return raw
+            return urlencode([(k, _REDACTED if k.lower() in _SECRET_PARAM_NAMES else v) for k, v in parts])
+
+        return urlunsplit(split._replace(query=_mask(split.query), fragment=_mask(split.fragment)))
+    except ValueError:
+        # Not parseable as a URL: fall back to the body redactor rather than risk a leak.
+        return redact_secrets(url)
+
+
+def redact_secrets(text: "Optional[str]") -> str:
+    """Return `text` with the values of any credential-bearing keys masked. Works on JSON
+    token bodies and arbitrary strings where :func:`redact_url` does not apply.
+    """
+    if not text:
+        return ""
+    return _SECRET_BODY_RE.sub(lambda m: f"{m.group('name')}={_REDACTED}", text)
+
+
 def is_marketing_consent_url(url: str) -> bool:
     """Report whether `url` points at the VW Group marketing consent page."""
     return MARKETING_CONSENT_PATH in urlsplit(url).path

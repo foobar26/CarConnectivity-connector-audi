@@ -21,6 +21,7 @@ from carconnectivity_connectors.audi.auth.auth_util import (
     GenericFormParser,
     is_marketing_consent_url,
     marketing_consent_callback_url,
+    redact_secrets,
 )
 from carconnectivity_connectors.audi.auth.openid_session import AccessType
 
@@ -36,11 +37,27 @@ DEVICE_CODE_SCOPE = "openid mbb profile badge cars dealers vin"
 # expire after ~300s, but we cap our own effort a little below that).
 DEVICE_CODE_TIMEOUT = 290
 
+# Once the server has told us the cold-start flow is not available for this client
+# (device_code grant revoked, 403 unauthorized_client — see issue, 2026-09-05), we stop
+# hammering it: further cold-start attempts fast-fail for this long instead of making a
+# fresh network call per expired request. A valid refresh token bypasses this entirely.
+COLDSTART_UNSUPPORTED_COOLDOWN = 3600
+
 if TYPE_CHECKING:
     pass
 
 
 LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.audi.auth")
+
+
+class StrategyNotSupportedError(AuthenticationError):
+    """The identity provider permanently refuses an OAuth flow for this client.
+
+    Distinct from bad credentials, a transient backend failure, or an expired token:
+    it means retrying the *same flow* is pointless. Today this is the revoked
+    ``device_code`` grant (HTTP 403 ``unauthorized_client``). Callers treat it as
+    "provide a refresh token minted on-device" rather than looping on the dead flow.
+    """
 
 
 class WeConnectSession(AudiWebSession):
@@ -61,6 +78,10 @@ class WeConnectSession(AudiWebSession):
         # rotated out and now returns 401 invalid_client (see issues #27/#28/#29).
         self.client_id = "09b6cbec-cd19-4589-82fd-363dfa8c24da@apps_vw-dilab_com"
         self.redirect_uri = "myaudi:///"
+
+        # Epoch after which a cold-start attempt may be retried; set when the server
+        # reports the device grant is not allowed (see COLDSTART_UNSUPPORTED_COOLDOWN).
+        self._coldstart_unsupported_until: float = 0.0
 
         LOG.debug(f"WeConnectSession initialized with client_id: {self.client_id}")
         LOG.debug(f"WeConnectSession initialized with redirect_uri: {self.redirect_uri}")
@@ -114,22 +135,38 @@ class WeConnectSession(AudiWebSession):
         )
 
     def login(self):
-        # Since July 2026 CARIAD requires Play Integrity attestation on the
-        # authorization_code token exchange (rejecting it with "invalid assertion
-        # headers"), so the old username/password -> code -> token flow is dead.
-        # Use the OAuth Device Authorization Grant instead, auto-approving the
-        # device with the stored credentials so the connector stays headless.
-        LOG.info("Starting Audi device-authorization login flow")
+        # Cold-start note (Architecture A): since July 2026 CARIAD gates the
+        # authorization_code token exchange behind Google Play Integrity, and since
+        # 2026-09-05 the device_code grant is revoked for this client (403
+        # unauthorized_client). Neither cold-start flow can complete off-device. The
+        # supported path is to seed a refresh_token minted by the genuine myAudi app
+        # (see token_provider.seed_refresh_token); login() here is the last resort and
+        # is expected to raise StrategyNotSupportedError until CARIAD restores a
+        # headless flow. refresh() is the hot path.
+        with self._auth_lock:
+            # Another thread may have authenticated us while we waited for the lock.
+            if self.authorized and not self.expired:
+                LOG.debug("Skipping Audi login; the session is already authenticated")
+                return
 
-        self._login_with_device_code()
+            now = time.time()
+            if now < self._coldstart_unsupported_until:
+                raise StrategyNotSupportedError(
+                    "Audi cold-start login is unavailable for this client and was already "
+                    "refused recently. Provide a refresh_token obtained from the genuine "
+                    "myAudi app (connector config 'refresh_token')."
+                )
 
-        if not self.token or "access_token" not in self.token:
-            raise AuthenticationError("Failed to obtain access token from device authorization flow")
+            LOG.info("Starting Audi device-authorization login flow")
+            self._login_with_device_code()
 
-        LOG.info("Login successful - tokens obtained via device authorization grant")
+            if not self.token or "access_token" not in self.token:
+                raise AuthenticationError("Failed to obtain access token from device authorization flow")
 
-        # Set the last_login time
-        self.last_login = time.time()
+            LOG.info("Login successful - tokens obtained via device authorization grant")
+
+            # Set the last_login time
+            self.last_login = time.time()
 
     def _login_with_device_code(self):
         """Run the OAuth Device Authorization Grant (RFC 8628) and auto-approve it.
@@ -147,8 +184,25 @@ class WeConnectSession(AudiWebSession):
             headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
         )
         if device_response.status_code != requests.codes["ok"]:
+            error = None
+            try:
+                error = device_response.json().get("error")
+            except ValueError:
+                pass
+            # 403 unauthorized_client / "not allowed to use the device_code grant" is a
+            # deliberate, client-level revocation, not an outage or a credential problem.
+            # Classify it so callers stop retrying the dead flow and start the cooldown.
+            if device_response.status_code == requests.codes["forbidden"] or error == "unauthorized_client":
+                self._coldstart_unsupported_until = time.time() + COLDSTART_UNSUPPORTED_COOLDOWN
+                raise StrategyNotSupportedError(
+                    "Audi refused the device_code grant for this client "
+                    f"(HTTP {device_response.status_code}, error={error!r}). Cold-start login "
+                    "is not available off-device; provide a refresh_token minted by the genuine "
+                    "myAudi app (connector config 'refresh_token')."
+                )
             raise AuthenticationError(
-                f"Device authorization request failed: {device_response.status_code} {device_response.text}"
+                f"Device authorization request failed: {device_response.status_code} "
+                f"{redact_secrets(device_response.text)}"
             )
         device_data = device_response.json()
         if "device_code" not in device_data:
@@ -318,7 +372,7 @@ class WeConnectSession(AudiWebSession):
                 interval += 5
                 time.sleep(interval)
             else:
-                raise AuthenticationError(f"Device token grant failed: {response.status_code} {response.text}")
+                raise AuthenticationError(f"Device token grant failed: {response.status_code} {redact_secrets(response.text)}")
 
         raise AuthenticationError("Timed out waiting for device authorization approval")
 
@@ -367,20 +421,38 @@ class WeConnectSession(AudiWebSession):
                 LOG.debug(f"Audi token exchange error response: {e.response.text}")
 
     def refresh(self) -> None:
-        # Try a standard OAuth2 refresh_token grant against the IDK OIDC token endpoint first
-        try:
-            LOG.info("Attempting token refresh using refresh_token grant")
-            self._refresh_with_refresh_token()
-            LOG.info("Token refresh successful")
-        except Exception as e:
-            LOG.warning(f"Token refresh failed: {e}")
+        # The hot path for Architecture A: a refresh_token grant is un-attested and is
+        # what keeps the connector running off-device. Only if that fails do we fall back
+        # to the (currently dead) cold-start login. The auth lock serialises concurrent
+        # refreshes so a burst of expired-token requests triggers one refresh, not many.
+        with self._auth_lock:
+            # Another thread may have refreshed us while we waited for the lock.
+            if self.authorized and not self.expired:
+                LOG.debug("Skipping Audi refresh; the session was already refreshed")
+                return
+            try:
+                LOG.info("Attempting token refresh using refresh_token grant")
+                self._refresh_with_refresh_token()
+                LOG.info("Token refresh successful")
+                return
+            except StrategyNotSupportedError:
+                raise
+            except AuthenticationError as e:
+                LOG.warning("Token refresh failed: %s", e)
+            except Exception as e:  # noqa: BLE001 - network/parse errors fall back to login
+                LOG.warning("Token refresh failed: %s", e)
+
             LOG.info("Falling back to full re-authentication using login flow")
-            # Fall back to the same login process that worked initially
             try:
                 self.login()
                 LOG.info("Fallback re-authentication successful")
+            except StrategyNotSupportedError as strategy_error:
+                # Cold start is not available; do not loop on it. A valid refresh token
+                # is the only way back, and we do not have one that works.
+                LOG.error("Audi re-authentication is not possible: %s", strategy_error)
+                raise
             except Exception as login_error:
-                LOG.error(f"Fallback re-authentication also failed: {login_error}")
+                LOG.error("Fallback re-authentication also failed: %s", login_error)
                 raise
 
     def _refresh_with_refresh_token(self):

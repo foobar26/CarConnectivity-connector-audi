@@ -9,7 +9,9 @@
                     "username": "your.email@example.com",
                     "password": "your_myaudi_password",
                     "country": "DE",
-                    "spin": "1234"
+                    "spin": "1234",
+                    "_comment_refresh_token": "Optional: a refresh_token minted by the genuine myAudi app on a real device (see README). Needed because Audi cold-start login is attestation-gated. Can also be supplied via the AUDI_REFRESH_TOKEN environment variable. Remove this placeholder line if unused.",
+                    "refresh_token": ""
                 }
             }
         ],

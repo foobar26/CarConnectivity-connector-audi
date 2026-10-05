@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -17,7 +18,7 @@ from oauthlib.oauth2.rfc6749.parameters import parse_authorization_code_response
 from oauthlib.oauth2.rfc6749.utils import is_secure_transport
 from requests.adapters import HTTPAdapter
 
-from carconnectivity_connectors.audi.auth.auth_util import add_bearer_auth_header
+from carconnectivity_connectors.audi.auth.auth_util import add_bearer_auth_header, redact_secrets, redact_url
 from carconnectivity_connectors.audi.auth.helpers.blacklist_retry import BlacklistRetry
 
 if TYPE_CHECKING:
@@ -75,6 +76,11 @@ class OpenIDSession(requests.Session):
         self._force_relogin_after = force_relogin_after
 
         self._retries: bool | int = False
+
+        # Serialises login()/refresh() so a burst of expired-token requests across the
+        # fetch threads results in a single authentication, not a login storm. Reentrant
+        # because refresh() may call login() while already holding it.
+        self._auth_lock: threading.RLock = threading.RLock()
 
     @property
     def force_relogin_after(self):
@@ -455,7 +461,7 @@ class OpenIDSession(requests.Session):
                 "This may indicate the authentication flow needs to be retried.",
                 str(err),
             )
-            LOG.debug("Authorization response that failed parsing: %s", authorization_response)
+            LOG.debug("Authorization response that failed parsing: %s", redact_url(authorization_response))
             # Don't set self.token to maintain any existing valid tokens
             raise AuthenticationError(f"Authentication parsing failed in headless environment: {err}") from err
 
@@ -469,7 +475,7 @@ class OpenIDSession(requests.Session):
             return self.token
         except (MissingCodeError, TokenExpiredError, MissingTokenError) as err:
             LOG.warning("Failed to parse token response: %s", str(err))
-            LOG.debug("Token response that failed parsing: %s", token_response)
+            LOG.debug("Token response that failed parsing: %s", redact_secrets(token_response))
             raise AuthenticationError(f"Token parsing failed: {err}") from err
 
     def request(  # noqa: C901

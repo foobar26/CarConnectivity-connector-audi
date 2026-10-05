@@ -63,6 +63,45 @@ For more information about the CarConnectivity framework, visit:
 }
 ```
 
+### Authentication and the `refresh_token` option
+
+Since September 2026 Audi/CARIAD no longer allows a fully headless cold-start
+login: the username/password → authorization-code token exchange is gated behind
+Google Play Integrity attestation (an `X-Assertion` header that only the genuine
+myAudi Android app on a real device can produce), and the device-code grant has
+been revoked for this client (`403 unauthorized_client`).
+
+What still works off-device is the **refresh token**: a `grant_type=refresh_token`
+request is not attested, and every vehicle status/charging/climate/lock/position
+call needs only an ordinary bearer token. So the connector supports an
+*initial-auth broker* model — do the one-time login on a genuine device, then let
+the connector run from the resulting refresh token:
+
+1. Sign in once in the genuine myAudi app on your (rooted) Android device.
+2. Read the `refresh_token` the app stored for your account.
+3. Provide it to the connector, either in the config:
+
+   ```json
+   {
+       "type": "audi",
+       "config": {
+           "username": "your.email@example.com",
+           "password": "your_password",
+           "refresh_token": "<token-from-the-myAudi-app>"
+       }
+   }
+   ```
+
+   or, to keep the secret out of the config file, via the `AUDI_REFRESH_TOKEN`
+   environment variable.
+
+The connector seeds this token only when its token store is empty, refreshes it
+itself from then on, and **never overwrites a working token** that is already
+cached. Username and password are still required (they key the session and are
+used by any future interactive flow). If the refresh token ever dies, repeat the
+three steps above after clearing the token file. Tokens and callback URLs are
+redacted from all logs.
+
 ## Usage
 
 ### List all available resources

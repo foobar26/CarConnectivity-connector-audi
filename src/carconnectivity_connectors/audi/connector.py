@@ -66,6 +66,7 @@ from oauthlib.oauth2.rfc6749.errors import MissingCodeError, MissingTokenError, 
 
 from carconnectivity_connectors.audi._version import __version__
 from carconnectivity_connectors.audi.auth.session_manager import Service, SessionManager, SessionUser
+from carconnectivity_connectors.audi.auth.token_provider import AudiTokenProvider, SessionTokenProvider, seed_refresh_token
 from carconnectivity_connectors.audi.auth.we_connect_session_audi import WeConnectSession
 from carconnectivity_connectors.audi.capability import Capability
 from carconnectivity_connectors.audi.charging import AudiCharging, mapping_audi_charging_state
@@ -206,6 +207,13 @@ class Connector(BaseConnector):
         else:
             self.active_config["spin"] = None
 
+        # Architecture A: an optional refresh_token minted on-device by the genuine myAudi
+        # app (which satisfies Google Play Integrity). CARIAD gates only the cold-start
+        # token exchange behind attestation; with a refresh_token the connector refreshes
+        # itself and drives every API call off-device. Env var provided so the secret need
+        # not sit in the config file. It is seeded only when no token is already stored.
+        self.active_config["refresh_token"] = config.get("refresh_token") or os.environ.get("AUDI_REFRESH_TOKEN")
+
         self.active_config["username"] = None
         self.active_config["password"] = None
         if "username" in config and "password" in config:
@@ -284,6 +292,15 @@ class Connector(BaseConnector):
             self.session.timeout,
         )
         LOG_API.debug("Audi API debug logger initialized")
+
+        # Seed an externally obtained refresh token (Architecture A) before the first
+        # refresh, so a fresh install can mint an access token without the dead cold-start
+        # flow. Never overwrites a token already restored from the token store.
+        if self.active_config.get("refresh_token"):
+            if seed_refresh_token(self.session, self.active_config["refresh_token"]):
+                LOG.info("Using the configured Audi refresh token for authentication")
+
+        self._token_provider: AudiTokenProvider = SessionTokenProvider(self.session)
 
         # Refresh tokens - handle missing refresh token gracefully (Audi-specific)
         try:
