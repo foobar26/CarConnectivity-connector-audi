@@ -87,3 +87,55 @@ class SpinCommand(GenericCommand):
 
         def __str__(self) -> str:
             return self.value
+
+
+class UpdateCommand(GenericCommand):
+    """
+    UpdateCommand triggers an immediate refresh of all vehicle data, without waiting for the next polling interval.
+
+    """
+
+    def __init__(
+        self, name: str = "update", parent: Optional[GenericObject] = None, initialization: Optional[Dict] = None
+    ) -> None:
+        super().__init__(name=name, parent=parent, initialization=initialization)
+
+    @property
+    def value(self) -> Optional[Union[str, Dict]]:
+        return super().value
+
+    @value.setter
+    def value(self, new_value: Optional[Union[str, Dict]]) -> None:
+        # Execute early hooks before parsing the value
+        new_value = self._execute_on_set_hook(new_value, early_hook=True)
+        if isinstance(new_value, UpdateCommand.Command):
+            new_value = {"command": new_value}
+        elif isinstance(new_value, str):
+            try:
+                new_value = {"command": UpdateCommand.Command(new_value.strip().lower() or "start")}
+            except ValueError as e:
+                raise SetterError(f"Invalid value for UpdateCommand. Command must be one of {list(UpdateCommand.Command)}") from e
+        elif isinstance(new_value, dict):
+            if "command" in new_value and isinstance(new_value["command"], str):
+                try:
+                    new_value["command"] = UpdateCommand.Command(new_value["command"])
+                except ValueError as e:
+                    raise ValueError(f"Invalid value for UpdateCommand. Command must be one of {list(UpdateCommand.Command)}") from e
+        if self._is_changeable:
+            # Execute late hooks before setting the value
+            new_value = self._execute_on_set_hook(new_value, early_hook=False)
+            self._set_value(new_value)
+        else:
+            raise TypeError("You cannot set this attribute. Attribute is not mutable.")
+
+    class Command(Enum):
+        """
+        Enum class representing different commands for update.
+
+        """
+
+        START = "start"
+        UPDATE = "update"
+
+        def __str__(self) -> str:
+            return self.value
