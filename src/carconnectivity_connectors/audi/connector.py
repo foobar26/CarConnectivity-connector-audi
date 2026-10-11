@@ -76,7 +76,7 @@ from carconnectivity_connectors.audi.auth.we_connect_session_audi import WeConne
 from carconnectivity_connectors.audi.capability import Capability
 from carconnectivity_connectors.audi.charging import AudiCharging, mapping_audi_charging_state
 from carconnectivity_connectors.audi.climatization import AudiClimatization
-from carconnectivity_connectors.audi.command_impl import SpinCommand
+from carconnectivity_connectors.audi.command_impl import SpinCommand, UpdateCommand
 from carconnectivity_connectors.audi.vehicle import (
     AudiCombustionVehicle,
     AudiElectricVehicle,
@@ -103,6 +103,7 @@ if TYPE_CHECKING:
 
     from carconnectivity.carconnectivity import CarConnectivity
 
+UPDATE_COMMAND_COOLDOWN = 60  # seconds; minimum spacing between manually triggered updates
 LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.audi")
 LOG_API: logging.Logger = logging.getLogger("carconnectivity.connectors.audi-api-debug")
 LOG_RAW_API: logging.Logger = logging.getLogger("carconnectivity.connectors.audi.rawapi")
@@ -169,6 +170,8 @@ class Connector(BaseConnector):
 
         self._background_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._wakeup_event = threading.Event()
+        self._last_cycle: float = 0.0
 
         self.connection_state: EnumAttribute = EnumAttribute(
             name="connection_state",
@@ -185,6 +188,10 @@ class Connector(BaseConnector):
         self.interval._is_changeable = True  # pylint: disable=protected-access
 
         self.commands: Commands = Commands(parent=self)
+        update_command = UpdateCommand(parent=self.commands)
+        update_command._add_on_set_hook(self.__on_update)  # pylint: disable=protected-access
+        update_command.enabled = True
+        self.commands.add_command(update_command)
 
         # Add global rawAPI endpoints
         self.rawAPI: GenericObject = GenericObject(
@@ -336,6 +343,7 @@ class Connector(BaseConnector):
         self.connection_state._set_value(value=ConnectionState.CONNECTING)  # pylint: disable=protected-access
         while not self._stop_event.is_set():
             interval = 300
+            self._last_cycle = time.monotonic()
             try:
                 try:
                     if fetch:
@@ -357,13 +365,13 @@ class Connector(BaseConnector):
                     str(err),
                 )
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
-                self._stop_event.wait(900)
+                self._stop_event.wait(900)  # rate-limit backoff: manual update triggers must not shorten it
             except RetrievalError as err:
                 LOG.error(
                     "Retrieval error during update (%s). Will try again after configured interval of %ss", str(err), interval
                 )
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
-                self._stop_event.wait(interval)
+                self._sleep(interval)
             except APICompatibilityError as err:
                 LOG.error(
                     "API compatability error during update (%s). Will try again after configured interval of %ss",
@@ -371,7 +379,7 @@ class Connector(BaseConnector):
                     interval,
                 )
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
-                self._stop_event.wait(interval)
+                self._sleep(interval)
             except TemporaryAuthenticationError as err:
                 LOG.error(
                     "Temporary authentification error during update (%s). Will try again after configured interval of %ss",
@@ -379,7 +387,7 @@ class Connector(BaseConnector):
                     interval,
                 )
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
-                self._stop_event.wait(interval)
+                self._sleep(interval)
             except (MissingTokenError, MissingCodeError, TokenExpiredError) as err:
                 LOG.error(
                     "OAuth authentication error during update (%s). This usually happens in "
@@ -394,7 +402,7 @@ class Connector(BaseConnector):
                     self.persist()
                 except Exception as persist_err:
                     LOG.warning("Failed to persist tokens after OAuth error: %s", str(persist_err))
-                self._stop_event.wait(interval)
+                self._sleep(interval)
             except Exception as err:
                 LOG.critical("Critical error during update: %s", traceback.format_exc())
                 self.healthy._set_value(value=False)  # pylint: disable=protected-access
@@ -407,9 +415,27 @@ class Connector(BaseConnector):
                     self.persist()
                 except Exception as persist_err:
                     LOG.warning("Failed to persist tokens after successful update: %s", str(persist_err))
-                self._stop_event.wait(interval)
+                self._sleep(interval)
         # When leaving the loop, set the connection state to disconnected
         self.connection_state._set_value(value=ConnectionState.DISCONNECTED)  # pylint: disable=protected-access
+
+    def _sleep(self, seconds: float) -> None:
+        """Sleep until the next cycle; returns early on a manual update trigger or shutdown."""
+        self._wakeup_event.wait(seconds)
+        self._wakeup_event.clear()
+
+    def __on_update(
+        self, update_command: UpdateCommand, command_arguments: Union[str, Dict[str, Any]]
+    ) -> Union[str, Dict[str, Any]]:
+        del update_command
+        if not isinstance(command_arguments, dict) or "command" not in command_arguments:
+            raise CommandError("Command argument missing")
+        if time.monotonic() - self._last_cycle < UPDATE_COMMAND_COOLDOWN:
+            LOG.info("Ignoring update command, last update was less than %ss ago", UPDATE_COMMAND_COOLDOWN)
+            return command_arguments
+        LOG.info("Update command received, refreshing now")
+        self._wakeup_event.set()
+        return command_arguments
 
     def persist(self) -> None:
         """
@@ -439,6 +465,7 @@ class Connector(BaseConnector):
                 self.car_connectivity.garage.remove_vehicle(vehicle.id)
                 vehicle.enabled = False
         self._stop_event.set()
+        self._wakeup_event.set()
         self.session.close()
         if self._background_thread is not None:
             self._background_thread.join()
