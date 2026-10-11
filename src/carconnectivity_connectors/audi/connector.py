@@ -188,10 +188,6 @@ class Connector(BaseConnector):
         self.interval._is_changeable = True  # pylint: disable=protected-access
 
         self.commands: Commands = Commands(parent=self)
-        update_command = UpdateCommand(parent=self.commands)
-        update_command._add_on_set_hook(self.__on_update)  # pylint: disable=protected-access
-        update_command.enabled = True
-        self.commands.add_command(update_command)
 
         # Add global rawAPI endpoints
         self.rawAPI: GenericObject = GenericObject(
@@ -484,6 +480,12 @@ class Connector(BaseConnector):
             spin_command._add_on_set_hook(self.__on_spin)  # pylint: disable=protected-access
             spin_command.enabled = True
             self.commands.add_command(spin_command)
+        # Add update command (registered here, not in __init__, so the MQTT plugin sees it being added)
+        if self.commands is not None and not self.commands.contains_command("update"):
+            update_command = UpdateCommand(parent=self.commands)
+            update_command._add_on_set_hook(self.__on_update)  # pylint: disable=protected-access
+            update_command.enabled = True
+            self.commands.add_command(update_command)
         self.fetch_vehicles()
         self.car_connectivity.transaction_end()
 
