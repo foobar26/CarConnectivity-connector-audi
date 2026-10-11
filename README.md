@@ -163,6 +163,22 @@ carconnectivity-cli audi_config.json set /garage/YOUR_VIN/climatization/commands
 carconnectivity-cli audi_config.json set /garage/YOUR_VIN/doors/commands/lock-unlock lock
 ```
 
+### Force an immediate update
+The connector polls every `interval` seconds (default 300, minimum 180). To refresh right away, e.g. from home automation, trigger the `update` command:
+
+```bash
+carconnectivity-cli audi_config.json set /connectors/audi/commands/update start
+```
+
+Via MQTT (with the [CarConnectivity MQTT plugin](https://github.com/tillsteinbach/CarConnectivity-plugin-mqtt)), publish `start` (or `update`) to the connector's write topic:
+
+```bash
+mosquitto_pub -h BROKER -u USER -P PASSWORD \
+  -t carconnectivity/0/connectors/audi/commands/update_writetopic -m start
+```
+
+Note the `_writetopic` suffix: publishing to `.../commands/update` itself is rejected. The refresh starts within a couple of seconds and `connectors/audi/last_update` changes when it completes. Triggers arriving less than 60 seconds after the previous update are ignored to avoid API throttling.
+
 ## Running with Docker
 
 You can run the Audi connector using Docker with the [CarConnectivity-MQTT](https://github.com/tillsteinbach/CarConnectivity-plugin-mqtt) image made by Till. This allows you to publish vehicle data to an MQTT broker for integration with home automation systems.
