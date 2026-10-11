@@ -187,7 +187,7 @@ class Connector(BaseConnector):
         self.interval.minimum = timedelta(seconds=180)
         self.interval._is_changeable = True  # pylint: disable=protected-access
 
-        self.commands: Commands = Commands(parent=self)
+        # self.commands is created by BaseConnector; a second Commands(parent=self) would shadow it for path lookups (MQTT writes)
 
         # Add global rawAPI endpoints
         self.rawAPI: GenericObject = GenericObject(
